@@ -37,6 +37,9 @@ pub struct Field {
     pub is_required: bool,
     pub is_nullable: bool,
     pub is_array_ref: bool,
+    /// When true, emit #[serde(flatten)] for query param structs (params at same level in GET)
+    #[serde(default)]
+    pub flatten: bool,
     pub description: Option<String>,
     /// Field-level Rust attributes from x-rust-attrs (e.g. #[serde(rename = "...")])
     #[serde(default)]
@@ -44,9 +47,9 @@ pub struct Field {
 }
 
 impl Field {
-    /// Returns true if this field should be flattened (for additionalProperties)
+    /// Returns true if this field should be flattened (for additionalProperties or query params)
     pub fn should_flatten(&self) -> bool {
-        self.name == "additional_properties"
+        self.name == "additional_properties" || self.flatten
     }
 }
 
