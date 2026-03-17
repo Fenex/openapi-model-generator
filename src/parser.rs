@@ -828,6 +828,9 @@ fn extract_type_and_format(
             SchemaKind::Type(Type::Object(_obj)) => {
                 Ok(("serde_json::Value".to_string(), "object".to_string()))
             }
+            SchemaKind::AllOf { all_of } if all_of.len() == 1 => {
+                extract_type_and_format(&all_of[0], all_schemas)
+            }
             _ => Ok(("serde_json::Value".to_string(), "unknown".to_string())),
         },
     }
@@ -1698,6 +1701,62 @@ mod tests {
             );
         } else {
             panic!("Expected Post to be a Struct");
+        }
+    }
+
+    #[test]
+    fn test_allof_single_ref_nullable_field() {
+        // allOf with one $ref, description and nullable as siblings (canonical format)
+        let openapi_spec: OpenAPI = serde_json::from_value(json!({
+            "openapi": "3.0.0",
+            "info": { "title": "Test API", "version": "1.0.0" },
+            "paths": {},
+            "components": {
+                "schemas": {
+                    "SceneSeries": {
+                        "type": "object",
+                        "nullable": false,
+                        "required": ["slug", "label"],
+                        "properties": {
+                            "slug": { "type": "string" },
+                            "label": { "type": "string" }
+                        }
+                    },
+                    "SceneItem": {
+                        "type": "object",
+                        "properties": {
+                            "series": {
+                                "allOf": [{ "$ref": "#/components/schemas/SceneSeries" }],
+                                "description": "Series this scene belongs to; null if standalone",
+                                "nullable": true
+                            }
+                        }
+                    }
+                }
+            }
+        }))
+        .expect("Failed to deserialize OpenAPI spec");
+
+        let (models, _, _) = parse_openapi(&openapi_spec).expect("Failed to parse OpenAPI spec");
+
+        let scene_item = models.iter().find(|m| m.name() == "SceneItem");
+        assert!(scene_item.is_some(), "Expected SceneItem model");
+
+        if let Some(ModelType::Struct(model)) = scene_item {
+            let series_field = model.fields.iter().find(|f| f.name == "series");
+            assert!(series_field.is_some(), "Expected series field");
+            let series = series_field.unwrap();
+            assert_eq!(
+                series.field_type, "SceneSeries",
+                "Expected field type SceneSeries, got {}",
+                series.field_type
+            );
+            assert!(
+                series.is_nullable,
+                "Expected series field to be nullable (sibling nullable: true)"
+            );
+        } else {
+            panic!("Expected SceneItem to be a Struct");
         }
     }
 
