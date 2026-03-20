@@ -846,7 +846,7 @@ fn extract_field_info(
 
     let (is_nullable, is_array_ref, en, description, custom_attrs) = match schema {
         ReferenceOr::Reference { reference } => {
-            let mut is_array_ref = false;
+            let is_array_ref = false;
             let mut is_nullable = false;
             let mut custom_attrs = None;
 
@@ -855,16 +855,7 @@ fn extract_field_info(
                     is_nullable = schema.schema_data.nullable;
                     custom_attrs = extract_custom_attrs(schema);
 
-                    if let SchemaKind::Type(Type::Array(array)) = &schema.schema_kind {
-                        let is_items_one_of = match &array.items {
-                            Some(ReferenceOr::Item(item_schema)) => {
-                                matches!(item_schema.schema_kind, SchemaKind::OneOf { .. })
-                            }
-                            _ => false,
-                        };
 
-                        is_array_ref = !is_items_one_of;
-                    }
                 }
             }
 
@@ -2399,6 +2390,58 @@ mod tests {
 
                 let name_field = struct_model.fields.iter().find(|f| f.name == "name");
                 assert!(name_field.unwrap().custom_attrs.is_none());
+            }
+            _ => panic!("Expected Struct"),
+        }
+    }
+
+    #[test]
+    fn test_ref_to_array_type_alias_not_double_wrapped() {
+        let openapi_spec = r#"
+openapi: "3.0.0"
+info:
+  title: Test
+  version: "1.0"
+paths: {}
+components:
+  schemas:
+    ImageUrlVariant:
+      type: object
+      properties:
+        width:
+          type: integer
+        url:
+          type: string
+    ImageUrls:
+      type: array
+      items:
+        $ref: '#/components/schemas/ImageUrlVariant'
+    SceneItem:
+      type: object
+      required:
+        - title
+        - thumb_urls
+      properties:
+        title:
+          type: string
+        thumb_urls:
+          $ref: '#/components/schemas/ImageUrls'
+"#;
+
+        let openapi_spec: OpenAPI = serde_yaml::from_str(openapi_spec).expect("Failed to parse YAML");
+
+        let (models, _, _) = parse_openapi(&openapi_spec).expect("Failed to parse OpenAPI spec");
+
+        let model = models.iter().find(|m| m.name() == "SceneItem");
+        assert!(model.is_some(), "Expected SceneItem model");
+
+        match model.unwrap() {
+            ModelType::Struct(struct_model) => {
+                let field = struct_model.fields.iter().find(|f| f.name == "thumb_urls");
+                assert!(field.is_some(), "Expected thumb_urls field");
+                let field = field.unwrap();
+                assert_eq!(field.field_type, "ImageUrls");
+                assert!(!field.is_array_ref, "Expected is_array_ref to be false");
             }
             _ => panic!("Expected Struct"),
         }
