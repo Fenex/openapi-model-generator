@@ -15,6 +15,50 @@ use std::collections::HashSet;
 const X_RUST_TYPE: &str = "x-rust-type";
 const X_RUST_ATTRS: &str = "x-rust-attrs";
 
+fn extract_custom_attrs_from_extension_value(value: &serde_json::Value) -> Option<Vec<String>> {
+    if let Some(arr) = value.as_array() {
+        let attrs: Vec<String> = arr
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect();
+        if attrs.is_empty() {
+            None
+        } else {
+            Some(attrs)
+        }
+    } else {
+        tracing::warn!(
+            "x-rust-attrs should be an array of strings, got: {:?}",
+            value
+        );
+        None
+    }
+}
+
+fn merge_custom_attrs(existing: Option<Vec<String>>, extra: Option<Vec<String>>) -> Option<Vec<String>> {
+    match (existing, extra) {
+        (Some(mut base), Some(extra)) => {
+            for attr in extra {
+                if !base.iter().any(|a| a == &attr) {
+                    base.push(attr);
+                }
+            }
+            Some(base)
+        }
+        (None, Some(extra)) => Some(extra),
+        (base, None) => base,
+    }
+}
+
+fn apply_parameter_custom_attrs(model_type: &mut ModelType, model_name: &str, attrs: &Option<Vec<String>>) {
+    if model_type.name() != model_name {
+        return;
+    }
+    if let ModelType::Struct(model) = model_type {
+        model.custom_attrs = merge_custom_attrs(model.custom_attrs.clone(), attrs.clone());
+    }
+}
+
 /// Information about a field extracted from OpenAPI schema
 #[derive(Debug)]
 struct FieldInfo {
@@ -48,25 +92,7 @@ fn extract_custom_attrs(schema: &Schema) -> Option<Vec<String>> {
         .schema_data
         .extensions
         .get(X_RUST_ATTRS)
-        .and_then(|value| {
-            if let Some(arr) = value.as_array() {
-                let attrs: Vec<String> = arr
-                    .iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                    .collect();
-                if attrs.is_empty() {
-                    None
-                } else {
-                    Some(attrs)
-                }
-            } else {
-                tracing::warn!(
-                    "x-rust-attrs should be an array of strings, got: {:?}",
-                    value
-                );
-                None
-            }
-        })
+        .and_then(extract_custom_attrs_from_extension_value)
 }
 
 pub fn parse_openapi(
@@ -124,6 +150,10 @@ pub fn parse_openapi(
         for (name, param_ref) in &components.parameters {
             if let ReferenceOr::Item(parameter) = param_ref {
                 let param_data = parameter.parameter_data_ref();
+                let parameter_custom_attrs = param_data
+                    .extensions
+                    .get(X_RUST_ATTRS)
+                    .and_then(extract_custom_attrs_from_extension_value);
                 if let ParameterSchemaOrContent::Schema(schema_ref) = &param_data.format {
                     // Resolve schema ref (for $ref, look up in components.schemas)
                     let resolved_schema_ref: &ReferenceOr<Schema> = match schema_ref {
@@ -145,11 +175,19 @@ pub fn parse_openapi(
                     );
 
                     if is_object_with_properties {
-                        let model_types = parse_schema_to_model_type(
+                        let mut model_types = parse_schema_to_model_type(
                             name,
                             resolved_schema_ref,
                             &components.schemas,
                         )?;
+                        let model_name = to_pascal_case(name);
+                        for model_type in &mut model_types {
+                            apply_parameter_custom_attrs(
+                                model_type,
+                                &model_name,
+                                &parameter_custom_attrs,
+                            );
+                        }
                         for model_type in model_types {
                             if added_models.insert(model_type.name().to_string()) {
                                 models.push(model_type);
@@ -188,7 +226,7 @@ pub fn parse_openapi(
                                         .and_then(extract_custom_attrs),
                                 },
                             }],
-                            custom_attrs: None,
+                            custom_attrs: parameter_custom_attrs,
                             description: param_data.description.clone(),
                         });
                         if added_models.insert(model.name().to_string()) {
