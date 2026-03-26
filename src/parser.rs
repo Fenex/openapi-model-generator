@@ -69,6 +69,38 @@ fn extract_custom_attrs(schema: &Schema) -> Option<Vec<String>> {
         })
 }
 
+/// Extracts custom Rust attributes from x-rust-attrs extension on a ParameterData.
+///
+/// Parameters can carry struct-level `x-rust-attrs` at the parameter level (not inside
+/// the schema). This function reads those extensions so they can be applied to the
+/// generated struct's `custom_attrs`.
+fn extract_parameter_custom_attrs(
+    param_data: &openapiv3::ParameterData,
+) -> Option<Vec<String>> {
+    param_data
+        .extensions
+        .get(X_RUST_ATTRS)
+        .and_then(|value| {
+            if let Some(arr) = value.as_array() {
+                let attrs: Vec<String> = arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect();
+                if attrs.is_empty() {
+                    None
+                } else {
+                    Some(attrs)
+                }
+            } else {
+                tracing::warn!(
+                    "x-rust-attrs on parameter should be an array of strings, got: {:?}",
+                    value
+                );
+                None
+            }
+        })
+}
+
 pub fn parse_openapi(
     openapi: &OpenAPI,
 ) -> Result<(Vec<ModelType>, Vec<RequestModel>, Vec<ResponseModel>)> {
@@ -145,11 +177,24 @@ pub fn parse_openapi(
                     );
 
                     if is_object_with_properties {
-                        let model_types = parse_schema_to_model_type(
+                        let mut model_types = parse_schema_to_model_type(
                             name,
                             resolved_schema_ref,
                             &components.schemas,
                         )?;
+                        // Merge parameter-level x-rust-attrs into the generated struct.
+                        // The x-rust-attrs may be on the parameter itself (not inside the schema),
+                        // so parse_schema_to_model_type would not see them.
+                        let param_custom_attrs = extract_parameter_custom_attrs(param_data);
+                        if let Some(ref param_attrs) = param_custom_attrs {
+                            for model_type in &mut model_types {
+                                if let ModelType::Struct(ref mut model) = model_type {
+                                    let existing =
+                                        model.custom_attrs.get_or_insert_with(Vec::new);
+                                    existing.extend(param_attrs.iter().cloned());
+                                }
+                            }
+                        }
                         for model_type in model_types {
                             if added_models.insert(model_type.name().to_string()) {
                                 models.push(model_type);
@@ -355,10 +400,27 @@ fn process_operation(
             }
         }
         if !param_fields.is_empty() {
+            // Collect struct-level x-rust-attrs from all query parameters (deduped).
+            // When multiple parameters each carry the same attribute (e.g. `#[serde_as]`),
+            // it is included only once in the merged struct.
+            let mut struct_custom_attrs: Vec<String> = Vec::new();
+            for (_param_name, (param, _component_name)) in &query_params {
+                if let Some(attrs) = extract_parameter_custom_attrs(param.parameter_data_ref()) {
+                    for attr in attrs {
+                        if !struct_custom_attrs.contains(&attr) {
+                            struct_custom_attrs.push(attr);
+                        }
+                    }
+                }
+            }
             inline_models.push(ModelType::Struct(Model {
                 name: params_model_name,
                 fields: param_fields,
-                custom_attrs: None,
+                custom_attrs: if struct_custom_attrs.is_empty() {
+                    None
+                } else {
+                    Some(struct_custom_attrs)
+                },
                 description: Some(format!(
                     "Query parameters for {}",
                     operation.operation_id.as_deref().unwrap_or("operation")
@@ -2444,6 +2506,145 @@ components:
                 assert!(!field.is_array_ref, "Expected is_array_ref to be false");
             }
             _ => panic!("Expected Struct"),
+        }
+    }
+
+    #[test]
+    fn test_parameter_level_x_rust_attrs_on_components_object_param() {
+        // When a components/parameters entry has x-rust-attrs at the parameter level
+        // (not inside the schema), those attrs must appear as the struct's custom_attrs.
+        let openapi_spec: OpenAPI = serde_json::from_value(json!({
+            "openapi": "3.0.0",
+            "info": { "title": "Test API", "version": "1.0.0" },
+            "paths": {},
+            "components": {
+                "parameters": {
+                    "PaginateParam": {
+                        "name": "paginate",
+                        "in": "query",
+                        "x-rust-attrs": ["#[serde_as]", "#[derive(Debug, Clone, Serialize, Deserialize, Default)]"],
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "limit": {
+                                    "type": "integer",
+                                    "x-rust-attrs": ["#[serde_as(as = \"Option<::serde_with::DisplayFromStr>\")]"]
+                                },
+                                "offset": {
+                                    "type": "integer",
+                                    "x-rust-attrs": ["#[serde_as(as = \"Option<::serde_with::DisplayFromStr>\")]"]
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }))
+        .expect("Failed to deserialize OpenAPI spec");
+
+        let (models, _, _) = parse_openapi(&openapi_spec).expect("Failed to parse OpenAPI spec");
+
+        let paginate_param = models.iter().find(|m| m.name() == "PaginateParam");
+        assert!(
+            paginate_param.is_some(),
+            "Expected PaginateParam model to be generated"
+        );
+
+        if let Some(ModelType::Struct(model)) = paginate_param {
+            // Struct-level custom_attrs must contain the parameter-level x-rust-attrs
+            let custom_attrs = model.custom_attrs.as_ref().expect(
+                "Expected PaginateParam to have custom_attrs from parameter-level x-rust-attrs",
+            );
+            assert!(
+                custom_attrs.contains(&"#[serde_as]".to_string()),
+                "Expected #[serde_as] in struct custom_attrs, got: {:?}",
+                custom_attrs
+            );
+            assert!(
+                custom_attrs.contains(
+                    &"#[derive(Debug, Clone, Serialize, Deserialize, Default)]".to_string()
+                ),
+                "Expected derive attr in struct custom_attrs, got: {:?}",
+                custom_attrs
+            );
+
+            // Field-level x-rust-attrs must still be present on the fields
+            let limit_field = model.fields.iter().find(|f| f.name == "limit");
+            assert!(limit_field.is_some(), "Expected limit field");
+            let limit_attrs = limit_field
+                .unwrap()
+                .custom_attrs
+                .as_ref()
+                .expect("Expected limit field to have custom_attrs");
+            assert!(
+                limit_attrs
+                    .iter()
+                    .any(|a| a.contains("serde_as(as =")),
+                "Expected field-level serde_as attr on limit, got: {:?}",
+                limit_attrs
+            );
+        } else {
+            panic!("Expected PaginateParam to be a Struct");
+        }
+    }
+
+    #[test]
+    fn test_parameter_level_x_rust_attrs_on_inline_operation_params() {
+        // When an operation references a parameter (via $ref) that carries x-rust-attrs
+        // at the parameter level, those attrs must appear in the generated *Params struct.
+        let openapi_spec: OpenAPI = serde_json::from_value(json!({
+            "openapi": "3.0.0",
+            "info": { "title": "Test API", "version": "1.0.0" },
+            "paths": {
+                "/items": {
+                    "get": {
+                        "operationId": "listItems",
+                        "parameters": [
+                            { "$ref": "#/components/parameters/PaginateParam" }
+                        ],
+                        "responses": { "200": { "description": "OK" } }
+                    }
+                }
+            },
+            "components": {
+                "parameters": {
+                    "PaginateParam": {
+                        "name": "paginate",
+                        "in": "query",
+                        "x-rust-attrs": ["#[serde_as]"],
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "limit": { "type": "integer" },
+                                "offset": { "type": "integer" }
+                            }
+                        }
+                    }
+                }
+            }
+        }))
+        .expect("Failed to deserialize OpenAPI spec");
+
+        let (models, _, _) = parse_openapi(&openapi_spec).expect("Failed to parse OpenAPI spec");
+
+        // The endpoint-level merged params struct
+        let params = models.iter().find(|m| m.name() == "ListItemsParams");
+        assert!(
+            params.is_some(),
+            "Expected ListItemsParams model to be generated"
+        );
+
+        if let Some(ModelType::Struct(model)) = params {
+            let custom_attrs = model.custom_attrs.as_ref().expect(
+                "Expected ListItemsParams to have custom_attrs from parameter x-rust-attrs",
+            );
+            assert!(
+                custom_attrs.contains(&"#[serde_as]".to_string()),
+                "Expected #[serde_as] in ListItemsParams custom_attrs, got: {:?}",
+                custom_attrs
+            );
+        } else {
+            panic!("Expected ListItemsParams to be a Struct");
         }
     }
 }
