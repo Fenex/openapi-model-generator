@@ -7,8 +7,8 @@ use crate::{
 };
 use indexmap::IndexMap;
 use openapiv3::{
-    AdditionalProperties, OpenAPI, ReferenceOr, Schema, SchemaKind, StringFormat, Type,
-    VariantOrUnknownOrEmpty,
+    AdditionalProperties, OpenAPI, Parameter, ParameterSchemaOrContent, ReferenceOr, Schema,
+    SchemaKind, StringFormat, Type, VariantOrUnknownOrEmpty,
 };
 use std::collections::HashSet;
 
@@ -69,6 +69,38 @@ fn extract_custom_attrs(schema: &Schema) -> Option<Vec<String>> {
         })
 }
 
+/// Extracts custom Rust attributes from x-rust-attrs extension on a ParameterData.
+///
+/// Parameters can carry struct-level `x-rust-attrs` at the parameter level (not inside
+/// the schema). This function reads those extensions so they can be applied to the
+/// generated struct's `custom_attrs`.
+fn extract_parameter_custom_attrs(
+    param_data: &openapiv3::ParameterData,
+) -> Option<Vec<String>> {
+    param_data
+        .extensions
+        .get(X_RUST_ATTRS)
+        .and_then(|value| {
+            if let Some(arr) = value.as_array() {
+                let attrs: Vec<String> = arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect();
+                if attrs.is_empty() {
+                    None
+                } else {
+                    Some(attrs)
+                }
+            } else {
+                tracing::warn!(
+                    "x-rust-attrs on parameter should be an array of strings, got: {:?}",
+                    value
+                );
+                None
+            }
+        })
+}
+
 pub fn parse_openapi(
     openapi: &OpenAPI,
 ) -> Result<(Vec<ModelType>, Vec<RequestModel>, Vec<ResponseModel>)> {
@@ -81,10 +113,15 @@ pub fn parse_openapi(
     let empty_schemas = IndexMap::new();
     let empty_request_bodies = IndexMap::new();
 
-    let (schemas, request_bodies) = if let Some(components) = &openapi.components {
-        (&components.schemas, &components.request_bodies)
+    let empty_parameters = IndexMap::new();
+    let (schemas, request_bodies, parameters) = if let Some(components) = &openapi.components {
+        (
+            &components.schemas,
+            &components.request_bodies,
+            &components.parameters,
+        )
     } else {
-        (&empty_schemas, &empty_request_bodies)
+        (&empty_schemas, &empty_request_bodies, &empty_parameters)
     };
 
     // Parse components/schemas
@@ -114,6 +151,98 @@ pub fn parse_openapi(
                 }
             }
         }
+
+        // Parse components/parameters - create structs for reusable query/path/header/cookie params
+        for (name, param_ref) in &components.parameters {
+            if let ReferenceOr::Item(parameter) = param_ref {
+                let param_data = parameter.parameter_data_ref();
+                if let ParameterSchemaOrContent::Schema(schema_ref) = &param_data.format {
+                    // Resolve schema ref (for $ref, look up in components.schemas)
+                    let resolved_schema_ref: &ReferenceOr<Schema> = match schema_ref {
+                        ReferenceOr::Item(_) => schema_ref,
+                        ReferenceOr::Reference { reference } => reference
+                            .strip_prefix("#/components/schemas/")
+                            .and_then(|schema_name| components.schemas.get(schema_name))
+                            .unwrap_or(schema_ref),
+                    };
+
+                    // Object schema with properties -> use parse_schema_to_model_type (PaginateParam etc.)
+                    let is_object_with_properties = matches!(
+                        resolved_schema_ref,
+                        ReferenceOr::Item(schema)
+                            if matches!(
+                                &schema.schema_kind,
+                                SchemaKind::Type(Type::Object(obj)) if !obj.properties.is_empty()
+                            )
+                    );
+
+                    if is_object_with_properties {
+                        let mut model_types = parse_schema_to_model_type(
+                            name,
+                            resolved_schema_ref,
+                            &components.schemas,
+                        )?;
+                        // Merge parameter-level x-rust-attrs into the generated struct.
+                        // The x-rust-attrs may be on the parameter itself (not inside the schema),
+                        // so parse_schema_to_model_type would not see them.
+                        let param_custom_attrs = extract_parameter_custom_attrs(param_data);
+                        if let Some(ref param_attrs) = param_custom_attrs {
+                            for model_type in &mut model_types {
+                                if let ModelType::Struct(ref mut model) = model_type {
+                                    let existing =
+                                        model.custom_attrs.get_or_insert_with(Vec::new);
+                                    existing.extend(param_attrs.iter().cloned());
+                                }
+                            }
+                        }
+                        for model_type in model_types {
+                            if added_models.insert(model_type.name().to_string()) {
+                                models.push(model_type);
+                            }
+                        }
+                    } else {
+                        // Primitive or ref (e.g. SexParam) -> single-field struct
+                        let (field_type, format) =
+                            extract_type_and_format(schema_ref, &components.schemas)?;
+                        let is_nullable = match schema_ref {
+                            ReferenceOr::Item(schema) => schema.schema_data.nullable,
+                            ReferenceOr::Reference { reference } => reference
+                                .strip_prefix("#/components/schemas/")
+                                .and_then(|schema_name| components.schemas.get(schema_name))
+                                .and_then(|s| s.as_item())
+                                .map(|s| s.schema_data.nullable)
+                                .unwrap_or(false),
+                        };
+                        let model = ModelType::Struct(Model {
+                            name: to_pascal_case(name),
+                            fields: vec![Field {
+                                name: param_data.name.clone(),
+                                field_type,
+                                format,
+                                is_required: param_data.required,
+                                is_nullable,
+                                is_array_ref: false,
+                                flatten: false,
+                                description: param_data.description.clone(),
+                                custom_attrs: match schema_ref {
+                                    ReferenceOr::Item(s) => extract_custom_attrs(s),
+                                    ReferenceOr::Reference { reference } => reference
+                                        .strip_prefix("#/components/schemas/")
+                                        .and_then(|schema_name| components.schemas.get(schema_name))
+                                        .and_then(|r| r.as_item())
+                                        .and_then(extract_custom_attrs),
+                                },
+                            }],
+                            custom_attrs: None,
+                            description: param_data.description.clone(),
+                        });
+                        if added_models.insert(model.name().to_string()) {
+                            models.push(model);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Parse paths
@@ -132,8 +261,15 @@ pub fn parse_openapi(
         ];
 
         for op in operations.iter().filter_map(|o| o.as_ref()) {
-            let inline_models =
-                process_operation(op, &mut requests, &mut responses, schemas, request_bodies)?;
+            let inline_models = process_operation(
+                op,
+                path_item,
+                &mut requests,
+                &mut responses,
+                schemas,
+                request_bodies,
+                parameters,
+            )?;
             for model_type in inline_models {
                 if added_models.insert(model_type.name().to_string()) {
                     models.push(model_type);
@@ -145,14 +281,153 @@ pub fn parse_openapi(
     Ok((models, requests, responses))
 }
 
+/// Resolves ReferenceOr<Parameter> to the actual Parameter (follows $ref to components/parameters).
+fn resolve_parameter<'a>(
+    param_ref: &'a ReferenceOr<Parameter>,
+    parameters: &'a IndexMap<String, ReferenceOr<Parameter>>,
+) -> Option<&'a Parameter> {
+    match param_ref {
+        ReferenceOr::Item(param) => Some(param),
+        ReferenceOr::Reference { reference } => reference
+            .strip_prefix("#/components/parameters/")
+            .and_then(|name| parameters.get(name))
+            .and_then(|r| r.as_item()),
+    }
+}
+
+/// Checks if parameter is a query parameter.
+fn is_query_parameter(param: &Parameter) -> bool {
+    matches!(param, Parameter::Query { .. })
+}
+
 fn process_operation(
     operation: &openapiv3::Operation,
+    path_item: &openapiv3::PathItem,
     requests: &mut Vec<RequestModel>,
     responses: &mut Vec<ResponseModel>,
     all_schemas: &IndexMap<String, ReferenceOr<Schema>>,
     request_bodies: &IndexMap<String, ReferenceOr<openapiv3::RequestBody>>,
+    parameters: &IndexMap<String, ReferenceOr<Parameter>>,
 ) -> Result<Vec<ModelType>> {
     let mut inline_models = Vec::new();
+
+    // Build unified query params struct for this endpoint (operation overrides path params)
+    // Collect (param_name, param, param_component_name) - component_name when param is $ref
+    let mut query_params: IndexMap<String, (&Parameter, Option<String>)> = IndexMap::new();
+    for param_ref in path_item
+        .parameters
+        .iter()
+        .chain(operation.parameters.iter())
+    {
+        if let Some(param) = resolve_parameter(param_ref, parameters) {
+            if is_query_parameter(param) {
+                let name = param.parameter_data_ref().name.clone();
+                let component_name = match param_ref {
+                    ReferenceOr::Reference { reference } => reference
+                        .strip_prefix("#/components/parameters/")
+                        .map(|s| s.to_string()),
+                    _ => None,
+                };
+                query_params.insert(name, (param, component_name));
+            }
+        }
+    }
+    if !query_params.is_empty() {
+        let operation_name = to_pascal_case(operation.operation_id.as_deref().unwrap_or("Unknown"));
+        let params_model_name = format!("{operation_name}Params");
+        let mut param_fields = Vec::new();
+        for (_param_name, (param, component_name)) in &query_params {
+            let param_data = param.parameter_data_ref();
+            if let ParameterSchemaOrContent::Schema(schema_ref) = &param_data.format {
+                let resolved_schema: &ReferenceOr<Schema> = match schema_ref {
+                    ReferenceOr::Item(_) => schema_ref,
+                    ReferenceOr::Reference { reference } => reference
+                        .strip_prefix("#/components/schemas/")
+                        .and_then(|n| all_schemas.get(n))
+                        .unwrap_or(schema_ref),
+                };
+                let is_object_with_props = matches!(
+                    resolved_schema,
+                    ReferenceOr::Item(s)
+                        if matches!(
+                            &s.schema_kind,
+                            SchemaKind::Type(Type::Object(obj)) if !obj.properties.is_empty()
+                        )
+                );
+                let schema_ref_to_schema = matches!(schema_ref, ReferenceOr::Reference { .. });
+                let (field_type, flatten) = if is_object_with_props {
+                    let model_name = component_name
+                        .as_deref()
+                        .map(|s| to_pascal_case(s))
+                        .unwrap_or_else(|| format!("{}Param", to_pascal_case(&param_data.name)));
+                    (model_name, true)
+                } else if schema_ref_to_schema && component_name.is_some() {
+                    let model_name = to_pascal_case(component_name.as_deref().unwrap_or(""));
+                    (model_name, true)
+                } else if schema_ref_to_schema {
+                    let (ft, _) = extract_type_and_format(schema_ref, all_schemas)?;
+                    (ft, false)
+                } else {
+                    let (ft, _) = extract_type_and_format(schema_ref, all_schemas)?;
+                    (ft, false)
+                };
+                let is_nullable = match schema_ref {
+                    ReferenceOr::Item(s) => s.schema_data.nullable,
+                    ReferenceOr::Reference { reference } => reference
+                        .strip_prefix("#/components/schemas/")
+                        .and_then(|n| all_schemas.get(n))
+                        .and_then(|s| s.as_item())
+                        .map(|s| s.schema_data.nullable)
+                        .unwrap_or(false),
+                };
+                // Schema/object params: no Option wrapper - optionality is in inner struct fields
+                let (is_required, is_nullable) = if flatten {
+                    (true, false)
+                } else {
+                    (param_data.required, is_nullable)
+                };
+                param_fields.push(Field {
+                    name: param_data.name.clone(),
+                    field_type,
+                    format: String::new(),
+                    is_required,
+                    is_nullable: is_nullable,
+                    is_array_ref: false,
+                    flatten,
+                    description: param_data.description.clone(),
+                    custom_attrs: resolved_schema.as_item().and_then(extract_custom_attrs),
+                });
+            }
+        }
+        if !param_fields.is_empty() {
+            // Collect struct-level x-rust-attrs from all query parameters (deduped).
+            // When multiple parameters each carry the same attribute (e.g. `#[serde_as]`),
+            // it is included only once in the merged struct.
+            let mut struct_custom_attrs: Vec<String> = Vec::new();
+            for (_param_name, (param, _component_name)) in &query_params {
+                if let Some(attrs) = extract_parameter_custom_attrs(param.parameter_data_ref()) {
+                    for attr in attrs {
+                        if !struct_custom_attrs.contains(&attr) {
+                            struct_custom_attrs.push(attr);
+                        }
+                    }
+                }
+            }
+            inline_models.push(ModelType::Struct(Model {
+                name: params_model_name,
+                fields: param_fields,
+                custom_attrs: if struct_custom_attrs.is_empty() {
+                    None
+                } else {
+                    Some(struct_custom_attrs)
+                },
+                description: Some(format!(
+                    "Query parameters for {}",
+                    operation.operation_id.as_deref().unwrap_or("operation")
+                )),
+            }));
+        }
+    }
 
     // Parse request body
     if let Some(request_body_ref) = &operation.request_body {
@@ -325,6 +600,7 @@ fn parse_schema_to_model_type(
                             is_required,
                             is_array_ref: field_info.is_array_ref,
                             is_nullable: field_info.is_nullable,
+                            flatten: false,
                             description: field_info.description,
                             custom_attrs: field_info.custom_attrs,
                         });
@@ -614,6 +890,9 @@ fn extract_type_and_format(
             SchemaKind::Type(Type::Object(_obj)) => {
                 Ok(("serde_json::Value".to_string(), "object".to_string()))
             }
+            SchemaKind::AllOf { all_of } if all_of.len() == 1 => {
+                extract_type_and_format(&all_of[0], all_schemas)
+            }
             _ => Ok(("serde_json::Value".to_string(), "unknown".to_string())),
         },
     }
@@ -629,7 +908,7 @@ fn extract_field_info(
 
     let (is_nullable, is_array_ref, en, description, custom_attrs) = match schema {
         ReferenceOr::Reference { reference } => {
-            let mut is_array_ref = false;
+            let is_array_ref = false;
             let mut is_nullable = false;
             let mut custom_attrs = None;
 
@@ -638,16 +917,7 @@ fn extract_field_info(
                     is_nullable = schema.schema_data.nullable;
                     custom_attrs = extract_custom_attrs(schema);
 
-                    if let SchemaKind::Type(Type::Array(array)) = &schema.schema_kind {
-                        let is_items_one_of = match &array.items {
-                            Some(ReferenceOr::Item(item_schema)) => {
-                                matches!(item_schema.schema_kind, SchemaKind::OneOf { .. })
-                            }
-                            _ => false,
-                        };
 
-                        is_array_ref = !is_items_one_of;
-                    }
                 }
             }
 
@@ -1027,6 +1297,7 @@ fn extract_fields_from_schema(
                             is_required,
                             is_nullable,
                             is_array_ref: field_info.is_array_ref,
+                            flatten: false,
                             description: field_info.description,
                             custom_attrs: field_info.custom_attrs,
                         });
@@ -1229,6 +1500,213 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_components_parameters() {
+        let openapi_spec: OpenAPI = serde_json::from_value(json!({
+            "openapi": "3.0.0",
+            "info": { "title": "Test API", "version": "1.0.0" },
+            "paths": {},
+            "components": {
+                "schemas": {
+                    "Sex": {
+                        "type": "string",
+                        "enum": ["MALE", "FEMALE"]
+                    }
+                },
+                "parameters": {
+                    "LimitParam": {
+                        "name": "limit",
+                        "in": "query",
+                        "description": "Maximum number of items to return per page",
+                        "required": false,
+                        "schema": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 100,
+                            "default": 20
+                        }
+                    },
+                    "OffsetParam": {
+                        "name": "offset",
+                        "in": "query",
+                        "description": "Number of items to skip",
+                        "required": false,
+                        "schema": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "default": 0
+                        }
+                    },
+                    "SexParam": {
+                        "name": "sex",
+                        "in": "query",
+                        "description": "Filter by sex",
+                        "required": false,
+                        "schema": { "$ref": "#/components/schemas/Sex" }
+                    }
+                }
+            }
+        }))
+        .expect("Failed to deserialize OpenAPI spec");
+
+        let (models, _, _) = parse_openapi(&openapi_spec).expect("Failed to parse OpenAPI spec");
+
+        // Verify LimitParam struct
+        let limit_param = models.iter().find(|m| m.name() == "LimitParam");
+        assert!(limit_param.is_some(), "Expected LimitParam model");
+        if let Some(ModelType::Struct(model)) = limit_param {
+            assert_eq!(model.fields.len(), 1);
+            assert_eq!(model.fields[0].name, "limit");
+            assert_eq!(model.fields[0].field_type, "i64");
+            assert!(!model.fields[0].is_required);
+        }
+
+        // Verify OffsetParam struct
+        let offset_param = models.iter().find(|m| m.name() == "OffsetParam");
+        assert!(offset_param.is_some(), "Expected OffsetParam model");
+        if let Some(ModelType::Struct(model)) = offset_param {
+            assert_eq!(model.fields.len(), 1);
+            assert_eq!(model.fields[0].name, "offset");
+            assert_eq!(model.fields[0].field_type, "i64");
+            assert!(!model.fields[0].is_required);
+        }
+
+        // Verify SexParam struct (schema ref resolves to Sex enum)
+        let sex_param = models.iter().find(|m| m.name() == "SexParam");
+        assert!(sex_param.is_some(), "Expected SexParam model");
+        if let Some(ModelType::Struct(model)) = sex_param {
+            assert_eq!(model.fields.len(), 1);
+            assert_eq!(model.fields[0].name, "sex");
+            assert_eq!(model.fields[0].field_type, "Sex");
+            assert!(!model.fields[0].is_required);
+        }
+
+        // Verify Sex enum was also generated (from schemas)
+        assert!(models.iter().any(|m| m.name() == "Sex"));
+    }
+
+    #[test]
+    fn test_endpoint_params_struct_with_flatten() {
+        let openapi_spec: OpenAPI = serde_json::from_value(json!({
+            "openapi": "3.0.0",
+            "info": { "title": "Test API", "version": "1.0.0" },
+            "paths": {
+                "/items": {
+                    "get": {
+                        "operationId": "listItems",
+                        "parameters": [
+                            { "$ref": "#/components/parameters/PaginateParam" },
+                            {
+                                "name": "filter",
+                                "in": "query",
+                                "schema": { "type": "string" }
+                            }
+                        ],
+                        "responses": { "200": { "description": "OK" } }
+                    }
+                }
+            },
+            "components": {
+                "parameters": {
+                    "PaginateParam": {
+                        "name": "pagination",
+                        "in": "query",
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "limit": { "type": "integer", "default": 20 },
+                                "offset": { "type": "integer", "default": 0 }
+                            }
+                        }
+                    }
+                }
+            }
+        }))
+        .expect("Failed to deserialize OpenAPI spec");
+
+        let (models, _, _) = parse_openapi(&openapi_spec).expect("Failed to parse OpenAPI spec");
+
+        // ListItemsParams should exist with pagination (flatten) and filter
+        let params = models.iter().find(|m| m.name() == "ListItemsParams");
+        assert!(
+            params.is_some(),
+            "Expected ListItemsParams for endpoint with query params"
+        );
+        if let Some(ModelType::Struct(model)) = params {
+            let pagination_field = model.fields.iter().find(|f| f.name == "pagination");
+            assert!(pagination_field.is_some(), "Expected pagination field");
+            assert!(
+                pagination_field.unwrap().flatten,
+                "pagination should have flatten for GET query"
+            );
+            assert_eq!(pagination_field.unwrap().field_type, "PaginateParam");
+
+            let filter_field = model.fields.iter().find(|f| f.name == "filter");
+            assert!(filter_field.is_some(), "Expected filter field");
+            assert!(!filter_field.unwrap().flatten);
+        }
+    }
+
+    #[test]
+    fn test_parse_parameter_with_object_schema_paginate_param() {
+        let openapi_spec: OpenAPI = serde_json::from_value(json!({
+            "openapi": "3.0.0",
+            "info": { "title": "Test API", "version": "1.0.0" },
+            "paths": {},
+            "components": {
+                "parameters": {
+                    "PaginateParam": {
+                        "name": "pagination",
+                        "in": "query",
+                        "description": "Pagination parameters (limit and offset)",
+                        "required": false,
+                        "style": "form",
+                        "explode": true,
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "limit": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                    "maximum": 100,
+                                    "default": 20,
+                                    "description": "Maximum number of items to return per page"
+                                },
+                                "offset": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "default": 0,
+                                    "description": "Number of items to skip"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }))
+        .expect("Failed to deserialize OpenAPI spec");
+
+        let (models, _, _) = parse_openapi(&openapi_spec).expect("Failed to parse OpenAPI spec");
+
+        // Verify PaginateParam struct has both limit and offset fields
+        let paginate_param = models.iter().find(|m| m.name() == "PaginateParam");
+        assert!(
+            paginate_param.is_some(),
+            "Expected PaginateParam model with object schema"
+        );
+        if let Some(ModelType::Struct(model)) = paginate_param {
+            assert_eq!(model.fields.len(), 2, "PaginateParam should have 2 fields");
+            let limit_field = model.fields.iter().find(|f| f.name == "limit");
+            let offset_field = model.fields.iter().find(|f| f.name == "offset");
+            assert!(limit_field.is_some(), "Expected limit field");
+            assert!(offset_field.is_some(), "Expected offset field");
+            assert_eq!(limit_field.unwrap().field_type, "i64");
+            assert_eq!(offset_field.unwrap().field_type, "i64");
+            assert!(!limit_field.unwrap().is_required);
+            assert!(!offset_field.unwrap().is_required);
+        }
+    }
+
+    #[test]
     fn test_nullable_reference_field() {
         // Test verifies that nullable is correctly read from the target schema when using $ref
         let openapi_spec: OpenAPI = serde_json::from_value(json!({
@@ -1276,6 +1754,62 @@ mod tests {
             );
         } else {
             panic!("Expected Post to be a Struct");
+        }
+    }
+
+    #[test]
+    fn test_allof_single_ref_nullable_field() {
+        // allOf with one $ref, description and nullable as siblings (canonical format)
+        let openapi_spec: OpenAPI = serde_json::from_value(json!({
+            "openapi": "3.0.0",
+            "info": { "title": "Test API", "version": "1.0.0" },
+            "paths": {},
+            "components": {
+                "schemas": {
+                    "SceneSeries": {
+                        "type": "object",
+                        "nullable": false,
+                        "required": ["slug", "label"],
+                        "properties": {
+                            "slug": { "type": "string" },
+                            "label": { "type": "string" }
+                        }
+                    },
+                    "SceneItem": {
+                        "type": "object",
+                        "properties": {
+                            "series": {
+                                "allOf": [{ "$ref": "#/components/schemas/SceneSeries" }],
+                                "description": "Series this scene belongs to; null if standalone",
+                                "nullable": true
+                            }
+                        }
+                    }
+                }
+            }
+        }))
+        .expect("Failed to deserialize OpenAPI spec");
+
+        let (models, _, _) = parse_openapi(&openapi_spec).expect("Failed to parse OpenAPI spec");
+
+        let scene_item = models.iter().find(|m| m.name() == "SceneItem");
+        assert!(scene_item.is_some(), "Expected SceneItem model");
+
+        if let Some(ModelType::Struct(model)) = scene_item {
+            let series_field = model.fields.iter().find(|f| f.name == "series");
+            assert!(series_field.is_some(), "Expected series field");
+            let series = series_field.unwrap();
+            assert_eq!(
+                series.field_type, "SceneSeries",
+                "Expected field type SceneSeries, got {}",
+                series.field_type
+            );
+            assert!(
+                series.is_nullable,
+                "Expected series field to be nullable (sibling nullable: true)"
+            );
+        } else {
+            panic!("Expected SceneItem to be a Struct");
         }
     }
 
@@ -1920,6 +2454,197 @@ mod tests {
                 assert!(name_field.unwrap().custom_attrs.is_none());
             }
             _ => panic!("Expected Struct"),
+        }
+    }
+
+    #[test]
+    fn test_ref_to_array_type_alias_not_double_wrapped() {
+        let openapi_spec = r#"
+openapi: "3.0.0"
+info:
+  title: Test
+  version: "1.0"
+paths: {}
+components:
+  schemas:
+    ImageUrlVariant:
+      type: object
+      properties:
+        width:
+          type: integer
+        url:
+          type: string
+    ImageUrls:
+      type: array
+      items:
+        $ref: '#/components/schemas/ImageUrlVariant'
+    SceneItem:
+      type: object
+      required:
+        - title
+        - thumb_urls
+      properties:
+        title:
+          type: string
+        thumb_urls:
+          $ref: '#/components/schemas/ImageUrls'
+"#;
+
+        let openapi_spec: OpenAPI = serde_yaml::from_str(openapi_spec).expect("Failed to parse YAML");
+
+        let (models, _, _) = parse_openapi(&openapi_spec).expect("Failed to parse OpenAPI spec");
+
+        let model = models.iter().find(|m| m.name() == "SceneItem");
+        assert!(model.is_some(), "Expected SceneItem model");
+
+        match model.unwrap() {
+            ModelType::Struct(struct_model) => {
+                let field = struct_model.fields.iter().find(|f| f.name == "thumb_urls");
+                assert!(field.is_some(), "Expected thumb_urls field");
+                let field = field.unwrap();
+                assert_eq!(field.field_type, "ImageUrls");
+                assert!(!field.is_array_ref, "Expected is_array_ref to be false");
+            }
+            _ => panic!("Expected Struct"),
+        }
+    }
+
+    #[test]
+    fn test_parameter_level_x_rust_attrs_on_components_object_param() {
+        // When a components/parameters entry has x-rust-attrs at the parameter level
+        // (not inside the schema), those attrs must appear as the struct's custom_attrs.
+        let openapi_spec: OpenAPI = serde_json::from_value(json!({
+            "openapi": "3.0.0",
+            "info": { "title": "Test API", "version": "1.0.0" },
+            "paths": {},
+            "components": {
+                "parameters": {
+                    "PaginateParam": {
+                        "name": "paginate",
+                        "in": "query",
+                        "x-rust-attrs": ["#[serde_as]", "#[derive(Debug, Clone, Serialize, Deserialize, Default)]"],
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "limit": {
+                                    "type": "integer",
+                                    "x-rust-attrs": ["#[serde_as(as = \"Option<::serde_with::DisplayFromStr>\")]"]
+                                },
+                                "offset": {
+                                    "type": "integer",
+                                    "x-rust-attrs": ["#[serde_as(as = \"Option<::serde_with::DisplayFromStr>\")]"]
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }))
+        .expect("Failed to deserialize OpenAPI spec");
+
+        let (models, _, _) = parse_openapi(&openapi_spec).expect("Failed to parse OpenAPI spec");
+
+        let paginate_param = models.iter().find(|m| m.name() == "PaginateParam");
+        assert!(
+            paginate_param.is_some(),
+            "Expected PaginateParam model to be generated"
+        );
+
+        if let Some(ModelType::Struct(model)) = paginate_param {
+            // Struct-level custom_attrs must contain the parameter-level x-rust-attrs
+            let custom_attrs = model.custom_attrs.as_ref().expect(
+                "Expected PaginateParam to have custom_attrs from parameter-level x-rust-attrs",
+            );
+            assert!(
+                custom_attrs.contains(&"#[serde_as]".to_string()),
+                "Expected #[serde_as] in struct custom_attrs, got: {:?}",
+                custom_attrs
+            );
+            assert!(
+                custom_attrs.contains(
+                    &"#[derive(Debug, Clone, Serialize, Deserialize, Default)]".to_string()
+                ),
+                "Expected derive attr in struct custom_attrs, got: {:?}",
+                custom_attrs
+            );
+
+            // Field-level x-rust-attrs must still be present on the fields
+            let limit_field = model.fields.iter().find(|f| f.name == "limit");
+            assert!(limit_field.is_some(), "Expected limit field");
+            let limit_attrs = limit_field
+                .unwrap()
+                .custom_attrs
+                .as_ref()
+                .expect("Expected limit field to have custom_attrs");
+            assert!(
+                limit_attrs
+                    .iter()
+                    .any(|a| a.contains("serde_as(as =")),
+                "Expected field-level serde_as attr on limit, got: {:?}",
+                limit_attrs
+            );
+        } else {
+            panic!("Expected PaginateParam to be a Struct");
+        }
+    }
+
+    #[test]
+    fn test_parameter_level_x_rust_attrs_on_inline_operation_params() {
+        // When an operation references a parameter (via $ref) that carries x-rust-attrs
+        // at the parameter level, those attrs must appear in the generated *Params struct.
+        let openapi_spec: OpenAPI = serde_json::from_value(json!({
+            "openapi": "3.0.0",
+            "info": { "title": "Test API", "version": "1.0.0" },
+            "paths": {
+                "/items": {
+                    "get": {
+                        "operationId": "listItems",
+                        "parameters": [
+                            { "$ref": "#/components/parameters/PaginateParam" }
+                        ],
+                        "responses": { "200": { "description": "OK" } }
+                    }
+                }
+            },
+            "components": {
+                "parameters": {
+                    "PaginateParam": {
+                        "name": "paginate",
+                        "in": "query",
+                        "x-rust-attrs": ["#[serde_as]"],
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "limit": { "type": "integer" },
+                                "offset": { "type": "integer" }
+                            }
+                        }
+                    }
+                }
+            }
+        }))
+        .expect("Failed to deserialize OpenAPI spec");
+
+        let (models, _, _) = parse_openapi(&openapi_spec).expect("Failed to parse OpenAPI spec");
+
+        // The endpoint-level merged params struct
+        let params = models.iter().find(|m| m.name() == "ListItemsParams");
+        assert!(
+            params.is_some(),
+            "Expected ListItemsParams model to be generated"
+        );
+
+        if let Some(ModelType::Struct(model)) = params {
+            let custom_attrs = model.custom_attrs.as_ref().expect(
+                "Expected ListItemsParams to have custom_attrs from parameter x-rust-attrs",
+            );
+            assert!(
+                custom_attrs.contains(&"#[serde_as]".to_string()),
+                "Expected #[serde_as] in ListItemsParams custom_attrs, got: {:?}",
+                custom_attrs
+            );
+        } else {
+            panic!("Expected ListItemsParams to be a Struct");
         }
     }
 }
