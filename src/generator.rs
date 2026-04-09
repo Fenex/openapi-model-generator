@@ -143,24 +143,11 @@ fn has_custom_serde(custom_attrs: &Option<Vec<String>>) -> bool {
     }
 }
 
-/// Generates custom attributes from x-rust-attrs.
-/// Proc-macro attributes like `#[serde_as]` are emitted before `#[derive(...)]`
-/// because they must transform the struct before derive macros execute.
+/// Generates custom attributes from x-rust-attrs
 fn generate_custom_attrs(custom_attrs: &Option<Vec<String>>) -> String {
     if let Some(attrs) = custom_attrs {
-        let mut before_derive = Vec::new();
-        let mut derive_and_rest = Vec::new();
-        for attr in attrs {
-            if attr.trim().starts_with("#[derive(") {
-                derive_and_rest.push(attr);
-            } else {
-                // proc-macro attributes (e.g. #[serde_as]) must come before #[derive]
-                before_derive.push(attr);
-            }
-        }
-        before_derive
+        attrs
             .iter()
-            .chain(derive_and_rest.iter())
             .map(|attr| format!("{attr}\n"))
             .collect::<String>()
     } else {
@@ -597,54 +584,4 @@ pub fn generate_lib() -> Result<String> {
     code.push_str("pub mod models;\n");
 
     Ok(code)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_generate_custom_attrs_serde_as_before_derive() {
-        // serde_as must come before derive for proc-macro ordering
-        let attrs = Some(vec![
-            "#[derive(Debug, Clone, Serialize, Deserialize, Default)]".to_string(),
-            "#[serde_as]".to_string(),
-        ]);
-        let result = generate_custom_attrs(&attrs);
-        let serde_as_pos = result.find("#[serde_as]").expect("serde_as missing");
-        let derive_pos = result.find("#[derive(").expect("derive missing");
-        assert!(
-            serde_as_pos < derive_pos,
-            "serde_as must come before derive, got:\n{result}"
-        );
-    }
-
-    #[test]
-    fn test_generate_custom_attrs_preserves_all_attrs() {
-        let attrs = Some(vec![
-            "#[derive(Debug)]".to_string(),
-            "#[serde_as]".to_string(),
-            "#[serde(rename_all = \"camelCase\")]".to_string(),
-        ]);
-        let result = generate_custom_attrs(&attrs);
-        assert!(result.contains("#[derive(Debug)]"));
-        assert!(result.contains("#[serde_as]"));
-        assert!(result.contains("#[serde(rename_all = \"camelCase\")]"));
-        // serde_as and serde(rename_all) before derive
-        let serde_as_pos = result.find("#[serde_as]").unwrap();
-        let derive_pos = result.find("#[derive(Debug)]").unwrap();
-        assert!(serde_as_pos < derive_pos);
-    }
-
-    #[test]
-    fn test_generate_custom_attrs_none() {
-        assert_eq!(generate_custom_attrs(&None), "");
-    }
-
-    #[test]
-    fn test_generate_custom_attrs_only_derive() {
-        let attrs = Some(vec!["#[derive(Debug)]".to_string()]);
-        let result = generate_custom_attrs(&attrs);
-        assert_eq!(result, "#[derive(Debug)]\n");
-    }
 }

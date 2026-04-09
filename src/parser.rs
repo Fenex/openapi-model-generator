@@ -393,22 +393,10 @@ fn process_operation(
             }
         }
         if !param_fields.is_empty() {
-            // Collect struct-level x-rust-attrs from all flattened query parameters
-            // so that e.g. #[serde_as] from PaginateParam propagates to the parent Params struct.
-            let mut inherited_attrs: Option<Vec<String>> = None;
-            for (_param_name, (param, _component_name)) in &query_params {
-                let param_data = param.parameter_data_ref();
-                let param_attrs = param_data
-                    .extensions
-                    .get(X_RUST_ATTRS)
-                    .and_then(extract_custom_attrs_from_extension_value)
-                    .map(|attrs| attrs.into_iter().filter(|a| !a.starts_with("#[derive(")).collect());
-                inherited_attrs = merge_custom_attrs(inherited_attrs, param_attrs);
-            }
             inline_models.push(ModelType::Struct(Model {
                 name: params_model_name,
                 fields: param_fields,
-                custom_attrs: inherited_attrs,
+                custom_attrs: None,
                 description: Some(format!(
                     "Query parameters for {}",
                     operation.operation_id.as_deref().unwrap_or("operation")
@@ -2494,108 +2482,6 @@ components:
                 assert!(!field.is_array_ref, "Expected is_array_ref to be false");
             }
             _ => panic!("Expected Struct"),
-        }
-    }
-
-    #[test]
-    fn test_inline_params_struct_inherits_serde_as_from_flattened_param() {
-        // When a components/parameters entry carries x-rust-attrs (e.g. #[serde_as])
-        // and an operation $ref's it, the generated *Params struct must inherit those attrs.
-        let openapi_spec: OpenAPI = serde_json::from_value(serde_json::json!({
-            "openapi": "3.0.0",
-            "info": { "title": "Test", "version": "1.0" },
-            "paths": {
-                "/scenes": {
-                    "get": {
-                        "operationId": "list_scenes",
-                        "parameters": [
-                            { "$ref": "#/components/parameters/PaginateParam" },
-                            { "name": "studio_slug", "in": "query", "schema": { "type": "string" } }
-                        ],
-                        "responses": { "200": { "description": "OK" } }
-                    }
-                }
-            },
-            "components": {
-                "parameters": {
-                    "PaginateParam": {
-                        "name": "paginate",
-                        "in": "query",
-                        "x-rust-attrs": ["#[serde_as]", "#[derive(Debug, Clone, Serialize, Deserialize, Default)]"],
-                        "schema": {
-                            "type": "object",
-                            "properties": {
-                                "limit": { "type": "integer" },
-                                "offset": { "type": "integer" }
-                            }
-                        }
-                    }
-                }
-            }
-        })).expect("Failed to parse spec");
-        let (models, _, _) = parse_openapi(&openapi_spec).expect("Failed to parse OpenAPI spec");
-
-        // The inline Params struct must exist and carry #[serde_as]
-        let params = models.iter().find(|m| m.name() == "ListScenesParams");
-        assert!(
-            params.is_some(),
-            "Expected ListScenesParams model, got: {:?}",
-            models.iter().map(|m| m.name()).collect::<Vec<_>>()
-        );
-
-        if let Some(ModelType::Struct(model)) = params {
-            let attrs = model
-                .custom_attrs
-                .as_ref()
-                .expect("ListScenesParams must have custom_attrs inherited from PaginateParam");
-            assert!(
-                attrs.contains(&"#[serde_as]".to_string()),
-                "Expected #[serde_as] in ListScenesParams custom_attrs, got: {:?}",
-                attrs
-            );
-            // #[derive(...)] must NOT be inherited — parent struct has its own derives
-            assert!(
-                !attrs.iter().any(|a| a.starts_with("#[derive(")),
-                "derive attrs must not be inherited from flattened param, got: {:?}",
-                attrs
-            );
-        } else {
-            panic!("Expected ListScenesParams to be a Struct");
-        }
-    }
-
-    #[test]
-    fn test_inline_params_struct_no_attrs_when_param_has_none() {
-        // When parameters have no x-rust-attrs, the generated Params struct
-        // should have custom_attrs = None (no spurious attributes).
-        let openapi_spec: OpenAPI = serde_json::from_value(serde_json::json!({
-            "openapi": "3.0.0",
-            "info": { "title": "Test", "version": "1.0" },
-            "paths": {
-                "/items": {
-                    "get": {
-                        "operationId": "list_items",
-                        "parameters": [
-                            { "name": "search", "in": "query", "schema": { "type": "string" } }
-                        ],
-                        "responses": { "200": { "description": "OK" } }
-                    }
-                }
-            }
-        })).expect("Failed to parse spec");
-        let (models, _, _) = parse_openapi(&openapi_spec).expect("Failed to parse OpenAPI spec");
-
-        let params = models.iter().find(|m| m.name() == "ListItemsParams");
-        assert!(params.is_some(), "Expected ListItemsParams model");
-
-        if let Some(ModelType::Struct(model)) = params {
-            assert!(
-                model.custom_attrs.is_none(),
-                "Expected no custom_attrs on ListItemsParams, got: {:?}",
-                model.custom_attrs
-            );
-        } else {
-            panic!("Expected ListItemsParams to be a Struct");
         }
     }
 }
