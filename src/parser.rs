@@ -70,8 +70,9 @@ struct FieldInfo {
     custom_attrs: Option<Vec<String>>,
 }
 
-/// Converts camelCase to PascalCase
-/// Example: "createRole" -> "CreateRole", "listRoles" -> "ListRoles", "listRoles-Input" -> "ListRolesInput"
+/// Converts camelCase or type names to PascalCase, preserving non-first characters as-is.
+/// Used for struct/type names where the input is already camelCase.
+/// Example: "createRole" -> "CreateRole", "listRoles-Input" -> "ListRolesInput"
 pub(crate) fn to_pascal_case(input: &str) -> String {
     input
         .split(&['-', '_'][..])
@@ -80,6 +81,27 @@ pub(crate) fn to_pascal_case(input: &str) -> String {
             let mut chars = s.chars();
             match chars.next() {
                 Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<String>()
+}
+
+/// Converts an OpenAPI enum value to a Rust PascalCase variant name.
+/// Splits on `_` and `-`, capitalises first char of each segment, lowercases the rest.
+/// Examples: "ACCESS_GRANTED_AT" -> "AccessGrantedAt", "SUBSCRIPTION" -> "Subscription",
+///           "trial_active" -> "TrialActive", "hero" -> "Hero"
+pub(crate) fn to_pascal_case_variant(input: &str) -> String {
+    input
+        .split(&['-', '_'][..])
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            let mut chars = s.chars();
+            match chars.next() {
+                Some(first) => {
+                    first.to_ascii_uppercase().to_string()
+                        + &chars.as_str().to_ascii_lowercase()
+                }
                 None => String::new(),
             }
         })

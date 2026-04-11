@@ -499,7 +499,7 @@ fn generate_enum(enum_model: &EnumModel) -> Result<String> {
     for (i, variant) in enum_model.variants.iter().enumerate() {
         let original = variant.clone();
 
-        let mut rust_name = crate::parser::to_pascal_case(variant);
+        let mut rust_name = crate::parser::to_pascal_case_variant(variant);
 
         let serde_rename = if is_reserved_word(&rust_name) {
             rust_name.push_str("Value");
