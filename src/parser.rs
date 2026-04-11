@@ -239,13 +239,10 @@ pub fn parse_openapi(
                                 is_array_ref: false,
                                 flatten: false,
                                 description: param_data.description.clone(),
+                                // Only apply custom_attrs from inline schemas, not from $ref targets.
                                 custom_attrs: match schema_ref {
                                     ReferenceOr::Item(s) => extract_custom_attrs(s),
-                                    ReferenceOr::Reference { reference } => reference
-                                        .strip_prefix("#/components/schemas/")
-                                        .and_then(|schema_name| components.schemas.get(schema_name))
-                                        .and_then(|r| r.as_item())
-                                        .and_then(extract_custom_attrs),
+                                    ReferenceOr::Reference { .. } => None,
                                 },
                             }],
                             custom_attrs: parameter_custom_attrs,
@@ -410,7 +407,12 @@ fn process_operation(
                     is_array_ref: false,
                     flatten,
                     description: param_data.description.clone(),
-                    custom_attrs: resolved_schema.as_item().and_then(extract_custom_attrs),
+                    // Only apply custom_attrs from inline schemas, not from $ref targets.
+                    // A referenced type's attrs belong to the type definition, not to each field that uses it.
+                    custom_attrs: match schema_ref {
+                        ReferenceOr::Item(s) => extract_custom_attrs(s),
+                        ReferenceOr::Reference { .. } => None,
+                    },
                 });
             }
         }
@@ -920,18 +922,16 @@ fn extract_field_info(
         ReferenceOr::Reference { reference } => {
             let is_array_ref = false;
             let mut is_nullable = false;
-            let mut custom_attrs = None;
 
             if let Some(type_name) = reference.strip_prefix("#/components/schemas/") {
                 if let Some(ReferenceOr::Item(schema)) = all_schemas.get(type_name) {
                     is_nullable = schema.schema_data.nullable;
-                    custom_attrs = extract_custom_attrs(schema);
-
-
+                    // Do NOT copy custom_attrs from the referenced type onto the field.
+                    // The referenced type's x-rust-attrs belong to the type definition only.
                 }
             }
 
-            (is_nullable, is_array_ref, None, None, custom_attrs)
+            (is_nullable, is_array_ref, None, None, None)
         }
 
         ReferenceOr::Item(schema) => {
@@ -2619,5 +2619,110 @@ components:
         } else {
             panic!("Expected ListItemsParams to be a Struct");
         }
+    }
+
+    // --- to_pascal_case_variant ---
+
+    #[test]
+    fn test_to_pascal_case_variant_single_word() {
+        assert_eq!(to_pascal_case_variant("ACTIVE"), "Active");
+        assert_eq!(to_pascal_case_variant("REVOKED"), "Revoked");
+        assert_eq!(to_pascal_case_variant("EXPIRED"), "Expired");
+    }
+
+    #[test]
+    fn test_to_pascal_case_variant_short_acronym() {
+        // "OTP" has no underscores; old to_pascal_case left it as "OTP".
+        // to_pascal_case_variant correctly lowercases non-first chars: "Otp".
+        assert_eq!(to_pascal_case_variant("OTP"), "Otp");
+        assert_eq!(to_pascal_case_variant("PROMO"), "Promo");
+        assert_eq!(to_pascal_case_variant("ADMIN"), "Admin");
+        assert_eq!(to_pascal_case_variant("SUBSCRIPTION"), "Subscription");
+    }
+
+    #[test]
+    fn test_to_pascal_case_variant_multiword_underscored() {
+        // Old to_pascal_case stripped underscores but kept chars uppercase → "ACCESSGRANTEDAT".
+        // to_pascal_case_variant capitalises first char of each segment, lowercases the rest.
+        assert_eq!(to_pascal_case_variant("ACCESS_GRANTED_AT"), "AccessGrantedAt");
+        assert_eq!(to_pascal_case_variant("CATALOG_ORDER"), "CatalogOrder");
+        assert_eq!(to_pascal_case_variant("PUBLISHED_AT"), "PublishedAt");
+        assert_eq!(to_pascal_case_variant("MANUAL_RANK"), "ManualRank");
+        assert_eq!(to_pascal_case_variant("RELEASE_DATE"), "ReleaseDate");
+        assert_eq!(
+            to_pascal_case_variant("CANCELLATION_PENDING_EXPIRY"),
+            "CancellationPendingExpiry"
+        );
+    }
+
+    // --- $ref field must NOT inherit the referenced enum's x-rust-attrs ---
+
+    #[test]
+    fn test_ref_field_does_not_inherit_enum_custom_attrs() {
+        // Regression: extract_field_info used to copy x-rust-attrs from the referenced schema
+        // onto every struct field that used it via $ref, causing strum/derive macros to appear
+        // on struct fields instead of only on the enum type definition.
+        let openapi_spec: OpenAPI = serde_json::from_value(json!({
+            "openapi": "3.0.0",
+            "info": { "title": "Test", "version": "1.0.0" },
+            "paths": {},
+            "components": {
+                "schemas": {
+                    "MyEnum": {
+                        "type": "string",
+                        "x-rust-attrs": [
+                            "#[derive(Debug, Clone, ::strum::Display, ::strum::EnumString)]",
+                            "#[strum(serialize_all = \"SCREAMING_SNAKE_CASE\")]"
+                        ],
+                        "enum": ["ALPHA", "BETA"]
+                    },
+                    "MyStruct": {
+                        "type": "object",
+                        "properties": {
+                            "kind": { "$ref": "#/components/schemas/MyEnum" },
+                            "name": { "type": "string" }
+                        }
+                    }
+                }
+            }
+        }))
+        .expect("Failed to deserialize OpenAPI spec");
+
+        let (models, _req, _resp) = parse_openapi(&openapi_spec).expect("parse failed");
+
+        let my_struct = models
+            .iter()
+            .find(|m| m.name() == "MyStruct")
+            .expect("MyStruct not found");
+
+        let ModelType::Struct(s) = my_struct else {
+            panic!("expected Struct, got {:?}", my_struct);
+        };
+
+        let kind_field = s
+            .fields
+            .iter()
+            .find(|f| f.name == "kind")
+            .expect("field 'kind' not found");
+
+        assert!(
+            kind_field.custom_attrs.is_none(),
+            "field 'kind' must not inherit x-rust-attrs from the referenced enum MyEnum, \
+             but got: {:?}",
+            kind_field.custom_attrs
+        );
+
+        // The enum itself must still carry its own attrs
+        let my_enum = models
+            .iter()
+            .find(|m| m.name() == "MyEnum")
+            .expect("MyEnum not found");
+        let ModelType::Enum(e) = my_enum else {
+            panic!("expected Enum, got {:?}", my_enum);
+        };
+        assert!(
+            e.custom_attrs.is_some(),
+            "MyEnum should retain its own custom_attrs from x-rust-attrs"
+        );
     }
 }

@@ -148,11 +148,20 @@ fn has_custom_serde(custom_attrs: &Option<Vec<String>>) -> bool {
 /// because they must transform the struct before derive macros execute.
 fn generate_custom_attrs(custom_attrs: &Option<Vec<String>>) -> String {
     if let Some(attrs) = custom_attrs {
-        let mut before_derive = Vec::new();
-        let mut derive_and_rest = Vec::new();
+        // Output order:
+        //   1. proc-macro attributes that must precede #[derive] (e.g. #[serde_as])
+        //   2. #[derive(...)] lines
+        //   3. derive-helper attributes that must follow #[derive] (e.g. #[strum(...)])
+        let mut before_derive: Vec<&String> = Vec::new();
+        let mut derives: Vec<&String> = Vec::new();
+        let mut after_derive: Vec<&String> = Vec::new();
         for attr in attrs {
-            if attr.trim().starts_with("#[derive(") {
-                derive_and_rest.push(attr);
+            let trimmed = attr.trim();
+            if trimmed.starts_with("#[derive(") {
+                derives.push(attr);
+            } else if trimmed.starts_with("#[strum(") {
+                // derive-helper: must come after #[derive(..., strum::...)]
+                after_derive.push(attr);
             } else {
                 // proc-macro attributes (e.g. #[serde_as]) must come before #[derive]
                 before_derive.push(attr);
@@ -160,7 +169,8 @@ fn generate_custom_attrs(custom_attrs: &Option<Vec<String>>) -> String {
         }
         before_derive
             .iter()
-            .chain(derive_and_rest.iter())
+            .chain(derives.iter())
+            .chain(after_derive.iter())
             .map(|attr| format!("{attr}\n"))
             .collect::<String>()
     } else {
@@ -646,5 +656,43 @@ mod tests {
         let attrs = Some(vec!["#[derive(Debug)]".to_string()]);
         let result = generate_custom_attrs(&attrs);
         assert_eq!(result, "#[derive(Debug)]\n");
+    }
+
+    #[test]
+    fn test_generate_custom_attrs_strum_after_derive() {
+        // Regression: #[strum(...)] is a derive-helper attribute — it must appear AFTER
+        // the #[derive(..., strum::EnumString)] line that introduces it.
+        // Previously all non-serde_as attrs were placed before derive, causing a compile error.
+        let attrs = Some(vec![
+            "#[derive(Debug, Clone, ::strum::Display, ::strum::EnumString)]".to_string(),
+            "#[strum(serialize_all = \"SCREAMING_SNAKE_CASE\")]".to_string(),
+        ]);
+        let result = generate_custom_attrs(&attrs);
+
+        let derive_pos = result.find("#[derive(").expect("derive missing");
+        let strum_pos = result.find("#[strum(").expect("#[strum( missing");
+
+        assert!(
+            derive_pos < strum_pos,
+            "#[strum(...)] must come after #[derive(...)], got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn test_generate_custom_attrs_strum_with_serde_as() {
+        // All three kinds present: serde_as (before derive), derive, strum (after derive)
+        let attrs = Some(vec![
+            "#[derive(Debug, ::strum::EnumString)]".to_string(),
+            "#[serde_as]".to_string(),
+            "#[strum(serialize_all = \"SCREAMING_SNAKE_CASE\")]".to_string(),
+        ]);
+        let result = generate_custom_attrs(&attrs);
+
+        let serde_as_pos = result.find("#[serde_as]").expect("serde_as missing");
+        let derive_pos = result.find("#[derive(").expect("derive missing");
+        let strum_pos = result.find("#[strum(").expect("#[strum( missing");
+
+        assert!(serde_as_pos < derive_pos, "serde_as must come before derive, got:\n{result}");
+        assert!(derive_pos < strum_pos, "#[strum(...)] must come after derive, got:\n{result}");
     }
 }
