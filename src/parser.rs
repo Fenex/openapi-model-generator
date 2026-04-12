@@ -944,13 +944,17 @@ fn extract_field_info(
             let is_nullable = schema.schema_data.nullable;
             let is_array_ref = matches!(schema.schema_kind, SchemaKind::Type(Type::Array(_)));
             let description = schema.schema_data.description.clone();
-            let custom_attrs = extract_custom_attrs(schema);
+            // custom_attrs is set below; for inline enums it stays None on the field
+            // (attrs belong to the generated enum type, not to the field referencing it)
+            let mut custom_attrs = extract_custom_attrs(schema);
 
             let maybe_enum = match &schema.schema_kind {
                 SchemaKind::Type(Type::String(s)) if !s.enumeration.is_empty() => {
                     let variants: Vec<String> =
                         s.enumeration.iter().filter_map(|v| v.clone()).collect();
                     field_type = to_pascal_case(field_name);
+                    // Do NOT propagate x-rust-attrs to the field — they belong to the enum type.
+                    custom_attrs = None;
                     Some(ModelType::Enum(EnumModel {
                         name: to_pascal_case(field_name),
                         variants,
@@ -2653,6 +2657,55 @@ components:
             to_pascal_case_variant("CANCELLATION_PENDING_EXPIRY"),
             "CancellationPendingExpiry"
         );
+    }
+
+    // --- inline enum field must NOT inherit the enum's x-rust-attrs ---
+
+    #[test]
+    fn test_inline_enum_field_does_not_inherit_enum_custom_attrs() {
+        // Regression: when a struct property is an inline string enum with x-rust-attrs,
+        // those attrs must appear only on the generated enum type, not on the struct field.
+        let openapi_spec: OpenAPI = serde_json::from_value(json!({
+            "openapi": "3.0.0",
+            "info": { "title": "Test", "version": "1.0.0" },
+            "paths": {},
+            "components": {
+                "schemas": {
+                    "MyStruct": {
+                        "type": "object",
+                        "properties": {
+                            "kind": {
+                                "type": "string",
+                                "x-rust-attrs": [
+                                    "#[derive(Debug, Clone, ::strum::Display, ::strum::EnumString)]",
+                                    "#[strum(serialize_all = \"SCREAMING_SNAKE_CASE\")]"
+                                ],
+                                "enum": ["ALPHA", "BETA"]
+                            },
+                            "name": { "type": "string" }
+                        }
+                    }
+                }
+            }
+        }))
+        .expect("Failed to deserialize OpenAPI spec");
+
+        let (models, _req, _resp) = parse_openapi(&openapi_spec).expect("parse failed");
+
+        let my_struct = models.iter().find(|m| m.name() == "MyStruct").expect("MyStruct not found");
+        let ModelType::Struct(s) = my_struct else { panic!("expected Struct") };
+
+        let kind_field = s.fields.iter().find(|f| f.name == "kind").expect("field 'kind' missing");
+        assert!(
+            kind_field.custom_attrs.is_none(),
+            "inline enum field must not carry x-rust-attrs, got: {:?}",
+            kind_field.custom_attrs
+        );
+
+        // The generated inline enum must still have the attrs
+        let kind_enum = models.iter().find(|m| m.name() == "Kind").expect("Kind enum not found");
+        let ModelType::Enum(e) = kind_enum else { panic!("expected Enum") };
+        assert!(e.custom_attrs.is_some(), "inline enum must retain x-rust-attrs");
     }
 
     // --- $ref field must NOT inherit the referenced enum's x-rust-attrs ---
