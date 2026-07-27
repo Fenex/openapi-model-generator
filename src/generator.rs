@@ -692,7 +692,13 @@ mod tests {
         let derive_pos = result.find("#[derive(").expect("derive missing");
         let strum_pos = result.find("#[strum(").expect("#[strum( missing");
 
-        assert!(serde_as_pos < derive_pos, "serde_as must come before derive, got:\n{result}");
-        assert!(derive_pos < strum_pos, "#[strum(...)] must come after derive, got:\n{result}");
+        assert!(
+            serde_as_pos < derive_pos,
+            "serde_as must come before derive, got:\n{result}"
+        );
+        assert!(
+            derive_pos < strum_pos,
+            "#[strum(...)] must come after derive, got:\n{result}"
+        );
     }
 }

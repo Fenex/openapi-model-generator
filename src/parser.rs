@@ -35,7 +35,10 @@ fn extract_custom_attrs_from_extension_value(value: &serde_json::Value) -> Optio
     }
 }
 
-fn merge_custom_attrs(existing: Option<Vec<String>>, extra: Option<Vec<String>>) -> Option<Vec<String>> {
+fn merge_custom_attrs(
+    existing: Option<Vec<String>>,
+    extra: Option<Vec<String>>,
+) -> Option<Vec<String>> {
     match (existing, extra) {
         (Some(mut base), Some(extra)) => {
             for attr in extra {
@@ -50,7 +53,11 @@ fn merge_custom_attrs(existing: Option<Vec<String>>, extra: Option<Vec<String>>)
     }
 }
 
-fn apply_parameter_custom_attrs(model_type: &mut ModelType, model_name: &str, attrs: &Option<Vec<String>>) {
+fn apply_parameter_custom_attrs(
+    model_type: &mut ModelType,
+    model_name: &str,
+    attrs: &Option<Vec<String>>,
+) {
     if model_type.name() != model_name {
         return;
     }
@@ -99,8 +106,7 @@ pub(crate) fn to_pascal_case_variant(input: &str) -> String {
             let mut chars = s.chars();
             match chars.next() {
                 Some(first) => {
-                    first.to_ascii_uppercase().to_string()
-                        + &chars.as_str().to_ascii_lowercase()
+                    first.to_ascii_uppercase().to_string() + &chars.as_str().to_ascii_lowercase()
                 }
                 None => String::new(),
             }
@@ -370,15 +376,12 @@ fn process_operation(
                 let (field_type, flatten) = if is_object_with_props {
                     let model_name = component_name
                         .as_deref()
-                        .map(|s| to_pascal_case(s))
+                        .map(to_pascal_case)
                         .unwrap_or_else(|| format!("{}Param", to_pascal_case(&param_data.name)));
                     (model_name, true)
                 } else if schema_ref_to_schema && component_name.is_some() {
                     let model_name = to_pascal_case(component_name.as_deref().unwrap_or(""));
                     (model_name, true)
-                } else if schema_ref_to_schema {
-                    let (ft, _) = extract_type_and_format(schema_ref, all_schemas)?;
-                    (ft, false)
                 } else {
                     let (ft, _) = extract_type_and_format(schema_ref, all_schemas)?;
                     (ft, false)
@@ -403,7 +406,7 @@ fn process_operation(
                     field_type,
                     format: String::new(),
                     is_required,
-                    is_nullable: is_nullable,
+                    is_nullable,
                     is_array_ref: false,
                     flatten,
                     description: param_data.description.clone(),
@@ -426,7 +429,12 @@ fn process_operation(
                     .extensions
                     .get(X_RUST_ATTRS)
                     .and_then(extract_custom_attrs_from_extension_value)
-                    .map(|attrs| attrs.into_iter().filter(|a| !a.starts_with("#[derive(")).collect());
+                    .map(|attrs| {
+                        attrs
+                            .into_iter()
+                            .filter(|a| !a.starts_with("#[derive("))
+                            .collect()
+                    });
                 inherited_attrs = merge_custom_attrs(inherited_attrs, param_attrs);
             }
             inline_models.push(ModelType::Struct(Model {
@@ -2504,7 +2512,8 @@ components:
           $ref: '#/components/schemas/ImageUrls'
 "#;
 
-        let openapi_spec: OpenAPI = serde_yaml::from_str(openapi_spec).expect("Failed to parse YAML");
+        let openapi_spec: OpenAPI =
+            serde_yaml::from_str(openapi_spec).expect("Failed to parse YAML");
 
         let (models, _, _) = parse_openapi(&openapi_spec).expect("Failed to parse OpenAPI spec");
 
@@ -2608,7 +2617,8 @@ components:
                     }
                 }
             }
-        })).expect("Failed to parse spec");
+        }))
+        .expect("Failed to parse spec");
         let (models, _, _) = parse_openapi(&openapi_spec).expect("Failed to parse OpenAPI spec");
 
         let params = models.iter().find(|m| m.name() == "ListItemsParams");
@@ -2648,7 +2658,10 @@ components:
     fn test_to_pascal_case_variant_multiword_underscored() {
         // Old to_pascal_case stripped underscores but kept chars uppercase → "ACCESSGRANTEDAT".
         // to_pascal_case_variant capitalises first char of each segment, lowercases the rest.
-        assert_eq!(to_pascal_case_variant("ACCESS_GRANTED_AT"), "AccessGrantedAt");
+        assert_eq!(
+            to_pascal_case_variant("ACCESS_GRANTED_AT"),
+            "AccessGrantedAt"
+        );
         assert_eq!(to_pascal_case_variant("CATALOG_ORDER"), "CatalogOrder");
         assert_eq!(to_pascal_case_variant("PUBLISHED_AT"), "PublishedAt");
         assert_eq!(to_pascal_case_variant("MANUAL_RANK"), "ManualRank");
@@ -2692,10 +2705,19 @@ components:
 
         let (models, _req, _resp) = parse_openapi(&openapi_spec).expect("parse failed");
 
-        let my_struct = models.iter().find(|m| m.name() == "MyStruct").expect("MyStruct not found");
-        let ModelType::Struct(s) = my_struct else { panic!("expected Struct") };
+        let my_struct = models
+            .iter()
+            .find(|m| m.name() == "MyStruct")
+            .expect("MyStruct not found");
+        let ModelType::Struct(s) = my_struct else {
+            panic!("expected Struct")
+        };
 
-        let kind_field = s.fields.iter().find(|f| f.name == "kind").expect("field 'kind' missing");
+        let kind_field = s
+            .fields
+            .iter()
+            .find(|f| f.name == "kind")
+            .expect("field 'kind' missing");
         assert!(
             kind_field.custom_attrs.is_none(),
             "inline enum field must not carry x-rust-attrs, got: {:?}",
@@ -2703,9 +2725,17 @@ components:
         );
 
         // The generated inline enum must still have the attrs
-        let kind_enum = models.iter().find(|m| m.name() == "Kind").expect("Kind enum not found");
-        let ModelType::Enum(e) = kind_enum else { panic!("expected Enum") };
-        assert!(e.custom_attrs.is_some(), "inline enum must retain x-rust-attrs");
+        let kind_enum = models
+            .iter()
+            .find(|m| m.name() == "Kind")
+            .expect("Kind enum not found");
+        let ModelType::Enum(e) = kind_enum else {
+            panic!("expected Enum")
+        };
+        assert!(
+            e.custom_attrs.is_some(),
+            "inline enum must retain x-rust-attrs"
+        );
     }
 
     // --- $ref field must NOT inherit the referenced enum's x-rust-attrs ---

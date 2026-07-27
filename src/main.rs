@@ -1,6 +1,7 @@
 use clap::Parser;
-use openapi_model_generator::{cli::Args, generator, parser, Error, GenerateMode, Result};
-use openapiv3::OpenAPI;
+use openapi_model_generator::{
+    cli::Args, document, generator, parser, Error, GenerateMode, Result,
+};
 use std::fs;
 use std::io;
 use std::path::PathBuf;
@@ -63,13 +64,7 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    let content = fs::read_to_string(&args.input)?;
-
-    let openapi: OpenAPI = if args.input.extension().is_some_and(|ext| ext == "yaml") {
-        serde_yaml::from_str(&content)?
-    } else {
-        serde_json::from_str(&content)?
-    };
+    let openapi = document::load_openapi_from_path(&args.input)?;
 
     let (models, requests, responses) = parser::parse_openapi(&openapi)?;
 
