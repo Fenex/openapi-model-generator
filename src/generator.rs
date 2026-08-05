@@ -67,7 +67,7 @@ const EMPTY_RESPONSE_NAME: &str = "UnknownResponse";
 const EMPTY_REQUEST_NAME: &str = "UnknownRequest";
 
 fn is_reserved_word(string_to_check: &str) -> bool {
-    RUST_RESERVED_KEYWORDS.contains(&string_to_check.to_lowercase().as_str())
+    RUST_RESERVED_KEYWORDS.contains(&string_to_check)
 }
 
 fn generate_description_docs(
@@ -676,6 +676,56 @@ mod tests {
             derive_pos < strum_pos,
             "#[strum(...)] must come after #[derive(...)], got:\n{result}"
         );
+    }
+
+    #[test]
+    fn test_generate_enum_pascal_case_reserved_keyword_not_renamed() {
+        // Rust keywords are lowercase-only; PascalCase variants like `Loop` are valid identifiers.
+        let enum_model = EnumModel {
+            name: "TranscodeKind".to_string(),
+            variants: vec![
+                "main".to_string(),
+                "trailer".to_string(),
+                "download".to_string(),
+                "loop".to_string(),
+            ],
+            description: None,
+            custom_attrs: None,
+        };
+
+        let output = generate_enum(&enum_model).expect("generate_enum");
+
+        assert!(
+            output.contains("#[serde(rename = \"loop\")]\n    Loop\n"),
+            "loop variant must map to `Loop`, not LoopValue; got:\n{output}"
+        );
+        assert!(
+            !output.contains("LoopValue"),
+            "must not append Value suffix for PascalCase keyword lookalikes; got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn test_generate_enum_lowercase_self_still_gets_value_suffix() {
+        let enum_model = EnumModel {
+            name: "Example".to_string(),
+            variants: vec!["self".to_string()],
+            description: None,
+            custom_attrs: None,
+        };
+
+        let output = generate_enum(&enum_model).expect("generate_enum");
+
+        assert!(
+            output.contains("#[serde(rename = \"self\")]\n    SelfValue\n"),
+            "Self is reserved in PascalCase and must become SelfValue; got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn test_is_reserved_word_snake_case_field() {
+        assert!(is_reserved_word("loop"));
+        assert!(!is_reserved_word("Loop"));
     }
 
     #[test]
